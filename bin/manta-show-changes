@@ -1,0 +1,369 @@
+#!/usr/bin/env node
+
+/*
+ * manta-show-changes.js: given a list of inputs on stdin describing services
+ * and their human-readable image versions, attempt to determine the tickets
+ * integrated in between those two.
+ */
+
+var mod_assertplus = require('assert-plus');
+var mod_cmdutil = require('cmdutil');
+var mod_forkexec = require('forkexec');
+var mod_jsprim = require('jsprim');
+var mod_lstream = require('lstream');
+var mod_path = require('path');
+var mod_strsplit = require('strsplit');
+var mod_vasync = require('vasync');
+var VError = require('verror');
+
+/* In verbose mode, we print more information about each change */
+var snVerbose = false;
+
+/* Path to a directory tree containing clones of all of the repos. */
+var snRepoRoot = mod_path.join(process.env['HOME'], 'work/reference/manta');
+
+/* Mapping of SAPI service names to the corresponding image names. */
+var snServiceToRepo = {
+    'authcache': 'mahi',
+    'electric-moray': 'electric-moray',
+    'jobpuller': 'manta-wrasse',
+    'jobsupervisor': 'manta-marlin',
+    'loadbalancer': 'muppet',
+    'madtom': 'manta-madtom',
+    'marlin': null,
+    'marlin-dashboard': 'manta-marlin-dashboard',
+    'medusa': 'manta-medusa',
+    'moray': 'moray',
+    'nameservice': 'binder',
+    'ops': 'manta-mola',
+    'postgres': 'manta-manatee',
+    'storage': 'manta-mako',
+    'webapi': 'manta-muskie'
+};
+
+function main()
+{
+	var queue;
+
+	mod_cmdutil.configure({
+	    'synopses': [ '' ],
+	    'usageMessage': 'determine tickets integrated since ' +
+	        'specified version'
+	});
+
+	if (process.argv.length != 2) {
+		mod_cmdutil.usage();
+	}
+
+	queue = mod_vasync.queuev({
+	    'concurrency': 4,
+	    'worker': snGatherChanges
+	});
+
+	snReadInput({
+	    'input': process.stdin
+	}, function (err, requests) {
+		if (err) {
+			mod_cmdutil.fail(err);
+		}
+
+		queue.on('end', function () {
+			snReportResults(requests);
+		});
+
+		requests.forEach(function (r) {
+			queue.push(r);
+		});
+
+		queue.close();
+	});
+}
+
+/*
+ * Reads the input to this command, which should be two columns separated by
+ * whitespace:
+ *
+ *     SAPI_service_name    human_readable_version
+ *
+ * This is generally the output from:
+ *
+ *     manta-adm show -s -o service,version | sort -u
+ *
+ * Specifying a service name multiple times is allowed and causes this command
+ * to produce separate output for each instance.  This is useful if you have two
+ * different versions of a service in use.
+ *
+ * Upon completion, this function invokes "callback" either with an error or an
+ * array of "request" objects, each representing an input line.  These objects
+ * are used elsewhere in the program.  They have properties:
+ *
+ *    service    the name of the service
+ *
+ *    repopath   the expected path to the local clone of the repository
+ *
+ *    version    an object describing the parsed version string (see below)
+ *
+ *    changes    null at first.  Later populated either with an instance of
+ *               Error (if there was a problem loading the changes) or an array
+ *               of change objects (see below)
+ */
+function snReadInput(args, callback)
+{
+	var stream, lstream, lines;
+
+	mod_assertplus.object(args, 'args');
+	mod_assertplus.object(args.input, 'args.input');
+	mod_assertplus.func(callback, 'callback');
+
+	stream = args.input;
+	lstream = new mod_lstream();
+	stream.pipe(lstream);
+	lines = [];
+
+	/* XXX Could use vstream for better error messages and debugging */
+	lstream.on('data', function (line) {
+		var parts, version, repopath;
+
+		parts = mod_strsplit.strsplit(line, /\s+/, 2);
+
+		if (line.length === 0) {
+			return;
+		}
+
+		if (parts[0] == 'SERVICE') {
+			/* This is a header line.  Ignore it. */
+			return;
+		}
+
+		if (!mod_jsprim.hasKey(snServiceToRepo,
+		    parts[0])) {
+			mod_cmdutil.warn('ignoring unknown service: %s ' +
+			    '(line: %s)', JSON.stringify(parts[0]),
+			    JSON.stringify(line));
+			return;
+		}
+
+		if (snServiceToRepo[parts[0]] === null) {
+			/*
+			 * Services like "marlin" should be ignored.  "marlin"
+			 * zones are general-purpose compute zones not built
+			 * from our source.
+			 */
+			return;
+		}
+
+		version = snParseVersionString(parts[1]);
+		if (version instanceof Error) {
+			mod_cmdutil.warn(version);
+			return;
+		}
+
+		repopath = mod_path.join(snRepoRoot, snServiceToRepo[parts[0]]);
+		lines.push({
+		    'service': parts[0],
+		    'repopath': repopath,
+		    'version': version,
+		    'changes': null
+		});
+	});
+
+	lstream.on('end', function () {
+		callback(null, lines);
+	});
+}
+
+/*
+ * This is a cheesy implementation of a parser for the version string for images
+ * that represent Triton and Manta components.  The version string looks like
+ * this:
+ *
+ *     $BRANCH-$BUILD_DATE-g$GIT_SHA
+ *
+ * (Yes, there's an extra "g" before the Git SHA, just like `git describe`
+ * produces.)  This returns either an Error, if there was a problem parsing the
+ * string, or else an object with properties:
+ *
+ *    branch    the name of the branch from which the image was built
+ *
+ *    builddate the string representing the date of the build
+ *
+ *    sha       the SHA of the top-level repo from which the image was built
+ *
+ *    raw       the input string itself
+ */
+function snParseVersionString(str)
+{
+	var p, q;
+	var sha, date, branch;
+
+	/*
+	 * It would be convenient to use strsplit to parse this, but $BRANCH can
+	 * itself contain hyphens (and frequently does, when non-master branches
+	 * are used), which makes it harder to do so.
+	 */
+	str = str.trim();
+	p = str.lastIndexOf('-');
+	if (p == -1) {
+		return (new VError('version string "%s": did not find Git SHA',
+		    str));
+	}
+	if (str.charAt(p + 1) != 'g') {
+		return (new VError('version string "%s": malformed Git SHA'));
+	}
+
+	q = str.lastIndexOf('-', p - 1);
+	if (q == -1) {
+		return (new VError('version string "%s": did not find ' +
+		    'build date', str));
+	}
+
+	branch = str.substr(0, q);
+	date = str.substr(q + 1, p - q - 1);
+	sha = str.substr(p + 2);
+
+	return ({
+	    'branch': branch,
+	    'builddate': date,
+	    'sha': sha,
+	    'raw': str
+	});
+}
+
+/*
+ * Given a "request" object (described above), use the local clones of the Git
+ * repositories to generate a log of changes since the specified SHA.  This
+ * populates the "request.changes" field with either an Error or an array of
+ * commit objects.
+ */
+function snGatherChanges(request, qcallback)
+{
+	mod_assertplus.object(request, 'obj');
+	mod_assertplus.string(request.service, 'request.service');
+	mod_assertplus.string(request.repopath, 'request.repopath');
+	mod_assertplus.object(request.version, 'request.version');
+	mod_assertplus.string(request.version.branch, 'request.version.branch');
+	mod_assertplus.string(request.version.sha, 'request.version.branch');
+
+	/*
+	 * We use `git log` to extract the changes.  We format it so that it
+	 * will be easier for us to parse.  This isn't bulletproof, but our
+	 * commit message format does not allow lines beginning with "commit "
+	 * in the first column, so the framing should not be brittle in
+	 * practice.
+	 */
+	mod_forkexec.forkExecWait({
+	    'cwd': request.repopath,
+	    'timeout': 10000,
+	    'maxBuffer': 100 * 1024,
+	    'includeStderr': true,
+	    'argv': [ 'git', 'log', '--pretty=format:commit %h%n%B',
+	        request.version.sha + '..master' ]
+	}, function (err, result) {
+		var log;
+
+		if (!err) {
+			log = snParseGitLog(result.stdout);
+			if (log instanceof Error) {
+				err = log;
+			}
+		}
+
+		if (err) {
+			request.changes = new VError(err,
+			    'service "%s" version "%s"', request.service,
+			    request.version);
+		} else {
+			request.changes = log;
+		}
+
+		qcallback();
+	});
+}
+
+/*
+ * Parse the raw output from `git log` using the format string in
+ * snGatherChanges().  The result is either an Error (if there was a problem
+ * parsing the log) or an array of objects describing each commit.  Each commit
+ * object has properties:
+ *
+ *     sha          the SHA of the commit
+ *
+ *     messageLines the body of the commit message, split into lines
+ *
+ *     issueLines   the lines from the commit message that are expected
+ *                  to identify tickets (i.e., with reviewer and approver lines
+ *                  ommitted)
+ */
+function snParseGitLog(log)
+{
+	var lines, commits, i;
+	var curcommit = null;
+
+	commits = [];
+	lines = log.split('\n');
+	for (i = 0; i < lines.length; i++) {
+		if (lines[i].length === 0) {
+			continue;
+		}
+
+		if (mod_jsprim.startsWith(lines[i], 'commit ')) {
+			if (curcommit !== null) {
+				commits.unshift(curcommit);
+			}
+
+			curcommit = {
+			    'sha': lines[i].substr('commit '.length),
+			    'messageLines': [],
+			    'issueLines': []
+			};
+			continue;
+		}
+
+		if (curcommit === null) {
+			continue;
+		}
+
+		curcommit.messageLines.push(lines[i]);
+		if (!mod_jsprim.startsWith(lines[i], 'Reviewed by:') &&
+		    !mod_jsprim.startsWith(lines[i], 'Approved by:')) {
+			curcommit.issueLines.push(lines[i]);
+		}
+	}
+
+	if (curcommit !== null) {
+		commits.unshift(curcommit);
+	}
+
+	return (commits);
+}
+
+/*
+ * Given a bunch of requests parsed from the input to this command and having
+ * "request.changes" populated with snGatherChanges(), print out a summary of
+ * the results.
+ */
+function snReportResults(requests)
+{
+	requests.forEach(function (request) {
+		console.log('%s: currently at %s', request.service,
+		    request.version.raw);
+		if (request.changes instanceof Error) {
+			console.log('    failed to list changes: %s',
+			    request.changes.message);
+			return;
+		}
+
+		request.changes.forEach(function (commit) {
+			if (snVerbose) {
+				console.log('    commit %s', commit.sha);
+			}
+			commit.issueLines.forEach(function (l) {
+				console.log('        %s', l);
+			});
+		});
+
+		console.log('');
+	});
+}
+
+main();

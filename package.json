@@ -1,0 +1,19 @@
+{
+	"name": "manta-show-changes",
+	"version": "1.0.0",
+	"description": "report changes between Manta image versions and latest changes in master",
+	"dependencies": {
+		"assert-plus": "^1.0.0",
+		"cmdutil": "^1.1.0",
+		"forkexec": "^1.1.0",
+		"jsprim": "^2.0.0",
+		"lstream": "^0.0.4",
+		"strsplit": "^1.0.0",
+		"vasync": "^2.2.0",
+		"verror": "^1.10.0"
+	},
+	"bin": {
+	    "manta-show-changes": "./bin/manta-show-changes"
+	},
+	"license": "MPL-2.0"
+}
