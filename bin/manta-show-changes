@@ -120,6 +120,10 @@ function snReadInput(args, callback)
 	stream.pipe(lstream);
 	lines = [];
 
+	if (stream.isTTY) {
+		mod_cmdutil.warn('reading from TTY');
+	}
+
 	/* XXX Could use vstream for better error messages and debugging */
 	lstream.on('data', function (line) {
 		var parts, version, repopath;

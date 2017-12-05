@@ -23,7 +23,7 @@ Next, clone and build this repository:
     $ cd manta-show-changes
     $ make
 
-Make sure each of your clones is cloean first:
+Make sure each of your clones is clean first:
 
     $ for repo in $HOME/work/reference/manta/*; do (cd $repo; git status); done
 
@@ -63,7 +63,7 @@ clones in $HOME/work/reference/manta.
 
 Finally, you're ready to run this tool:
 
-    $ ./manta-show-versions < service_versions.txt
+    $ ./bin/manta-show-changes < service_versions.txt
     authcache: currently at master-20170919T233646Z-g75ac3ca
             MANTA-3508 invalid user added to "operators" group, mahi sadness ensues
     
